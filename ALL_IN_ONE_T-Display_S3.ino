@@ -10,7 +10,6 @@
 #include "FREQFONT.h"
 #include "NotoMono16.h"
 #include "esp_sleep.h"
-#include <driver/rtc_io.h>
 //#include "driver/adc.h"
 #include "Battery.h"
 const uint16_t size_content = sizeof ssb_patch_content;  // see patch_init.h
@@ -1916,33 +1915,31 @@ void loop() {
       screenAsleep = true;
     }
 
-    // 唤醒源：编码器 A 相、B 相、编码器按键，任意一个被拉低都唤醒。
-    // 原来只挂了 B 相(ext0)，熄屏后按一下按键是叫不醒的 —— 浅睡期间普通
-    // attachInterrupt 不工作，GPIO21 不在唤醒源里。
+    // 浅睡只能用数字 GPIO 唤醒：gpio_wakeup_enable + esp_sleep_enable_gpio_wakeup。
+    // ext0/ext1 是深睡的 RTC 唤醒源，而且 EC11 静止时两相都是低电平（见 Rotary.cpp
+    // 顶部表格 Step1 0 0），ANY_LOW 意味着唤醒条件永远满足 —— 浅睡立刻返回、反复
+    // 进出，GPIO 的 CHANGE 中断被打断后不再恢复，表现就是转编码器没反应。
+    // 这里按「当前电平的反相」设唤醒：静止时稳定，任何一个脚一动就醒。
     pinMode(ENCODER_PIN_A, INPUT_PULLUP);
     pinMode(ENCODER_PIN_B, INPUT_PULLUP);
     pinMode(ENCODER_PUSH_BUTTON, INPUT_PULLUP);
-    rtc_gpio_pullup_en((gpio_num_t)ENCODER_PIN_A);       // 进浅睡后 GPIO 矩阵的上拉不保持，要配 RTC 域
-    rtc_gpio_pullup_en((gpio_num_t)ENCODER_PIN_B);
-    rtc_gpio_pullup_en((gpio_num_t)ENCODER_PUSH_BUTTON);
 
-    esp_sleep_enable_ext1_wakeup((1ULL << ENCODER_PIN_A) |
-                                 (1ULL << ENCODER_PIN_B) |
-                                 (1ULL << ENCODER_PUSH_BUTTON),
-                                 ESP_EXT1_WAKEUP_ANY_LOW);
+    gpio_wakeup_enable((gpio_num_t)ENCODER_PIN_A,
+                       digitalRead(ENCODER_PIN_A) ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)ENCODER_PIN_B,
+                       digitalRead(ENCODER_PIN_B) ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)ENCODER_PUSH_BUTTON, GPIO_INTR_LOW_LEVEL);  // 按下 = 低
+    esp_sleep_enable_gpio_wakeup();
 
-    unsigned long beforeSleep = millis();
     esp_light_sleep_start();
 
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
-      // 是编码器或按键把人叫醒的，就直接亮屏，别让用户再转一下
-      lastActiveTime = millis();
-      lcdoff(false);
-    } else if (millis() - beforeSleep < 10) {
-      // 唤醒条件已经满足时 esp_light_sleep_start() 会立刻返回（比如按键一直按着），
-      // 这里兜个底，免得变成 80MHz 空转
-      delay(30);
-    }
+    // 浅睡退出后 GPIO 中断不会自动恢复，必须重挂，否则编码器转了也白转
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), rotaryEncoder, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), rotaryEncoder, CHANGE);
+
+    // 能从浅睡里出来就说明有引脚动了（或按键按下），直接亮屏，别让用户再转一下
+    lastActiveTime = millis();
+    lcdoff(false);
  }
  else
  {

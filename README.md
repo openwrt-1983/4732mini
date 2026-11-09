@@ -61,7 +61,7 @@ arduino-cli compile -b esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=huge_ap
 
 ### 会崩 / 会费电 / 会丢数据
 
-1. **熄屏浅睡唤醒源错误**：原来 `esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, LOW)` 是**电平**触发，EC11 静止时 GPIO1 常为低电平，进睡即刻满足唤醒条件 → 熄屏后 80 MHz 空转、掉电反而更快；且只挂了 B 相，**按键按不醒**。改为 `ext1 ANY_LOW` 挂 A 相 / B 相 / 按键三个脚，补 RTC 域上拉，按 `esp_sleep_get_wakeup_cause()` 直接亮屏，并留「立即返回就 `delay(30)`」兜底。
+1. **熄屏浅睡唤醒源错误**：原来 `esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, LOW)` 是**电平**触发，EC11 静止时 GPIO1 常为低电平，进睡即刻满足唤醒条件 → 熄屏后 80 MHz 空转、掉电反而更快；且只挂了 B 相，**按键按不醒**。已改为浅睡专用的 `gpio_wakeup_enable()` + `esp_sleep_enable_gpio_wakeup()`：A 相 / B 相 / 按键三个脚都挂上，唤醒电平按「当前电平的反相」设置（静止时稳定、一动就醒），每次浅睡退出后重新挂回编码器的 CHANGE 中断，唤醒后直接亮屏。
 2. **EEPROM 回读无边界校验**：`bandIdx` / `currentMode` / 步进 / 带宽 / 频率等直接从 EEPROM 读出就用，一旦数据损坏（读回 255）就是 `band[255]` 之类的越界写 → 随机死机、白屏、重启循环。现已全部钳位到合法区间，非法值回落默认。
 3. **`station[50]` 越界**：数组 50 项，`readsavednumcount()` 从 1 写到 50，`station[50]` 越界；菜单里 `station[selnum]` 同样越界读。数组改 51，`storenumber` 显式 50，读写都校验 1–50。
 
