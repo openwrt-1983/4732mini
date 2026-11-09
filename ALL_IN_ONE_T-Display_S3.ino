@@ -10,6 +10,7 @@
 #include "FREQFONT.h"
 #include "NotoMono16.h"
 #include "esp_sleep.h"
+#include <driver/rtc_io.h>
 //#include "driver/adc.h"
 #include "Battery.h"
 const uint16_t size_content = sizeof ssb_patch_content;  // see patch_init.h
@@ -81,11 +82,13 @@ const int eeprom_address = 0;
 long storeTime = millis();
 int savenum = 1;                                         //存储选择
 int selnum = 1;                                          //读取选择
-int station[50];                                         //存储电台数组  100显示不下
-const int storenumber = (sizeof station / sizeof(int));  //实际存储数51 从1开始存储
+// 电台号码表：槽位 1-50 有效，索引 0 保留不用；数组长度必须 +1，否则 station[50] 越界
+int station[51];
+const int storenumber = 50;  //可存电台数量（1..50）
 
-int lcdofftime = 5;  //熄屏时间
+int lcdofftime = 5;  //熄屏时间，0 = 不自动熄屏
 bool lcdoffed;
+bool screenAsleep = false;  //屏幕是否已经发过 SLPIN
 
 unsigned long lastActiveTime = 0;  // 最后活动时间记录
 unsigned long lcdondelaytime = 0;
@@ -288,6 +291,13 @@ SI4735 rx;
 
 
 
+// 背光 PWM：2.x 用通道号，3.x 改成用引脚号
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#define LEDC_BL_CH PIN_LCD_BL
+#else
+#define LEDC_BL_CH 0
+#endif
+
 void setup() {
   //SerialBT.begin("SI4732-MINI"); // 蓝牙设备名称
 
@@ -302,10 +312,18 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setRotation(3);
   spr.setSwapBytes(true);
-  spr.createSprite(320, 170);
+  if (spr.createSprite(320, 170) == nullptr) {  // 分配失败时后面每个 spr 调用都会解引用空指针
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("sprite alloc failed", 10, 40, 2);
+    while (1) delay(100);
+  }
 
-  ledcSetup(0, 15000, 8);        //频率提高后背光底噪消失 原频率2000
-  ledcAttachPin(PIN_LCD_BL, 0);  //esp 2.x
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_LCD_BL, 15000, 8);  // arduino-esp32 3.x
+#else
+  ledcSetup(0, 15000, 8);            //频率提高后背光底噪消失 原频率2000
+  ledcAttachPin(PIN_LCD_BL, 0);      // arduino-esp32 2.x
+#endif
 
   //ledcAttach(PIN_LCD_BL, 15000, LEDC_TIMER_8_BIT); //背光初始化
 
@@ -356,8 +374,8 @@ void setup() {
   rx.setAudioMuteMcuPin(AUDIO_MUTE);
 
   if (brightness != 0) {
-    ledcWrite(0, brightness);
-  } else ledcWrite(0, 50);
+    ledcWrite(LEDC_BL_CH, brightness);
+  } else ledcWrite(LEDC_BL_CH, 50);
   
   if(CONV_FACTOR>10) CONV_FACTOR=1.7;
 
@@ -392,12 +410,10 @@ void printParam(const char *msg) {
  * @param debounceTime   防抖时间（默认50ms）
  * @param longPressTime  长按阈值（默认1000ms）
  * @param multiClickTimeout 多击超时时间（默认300ms）
- * @return 事件编码：
- *   0 = 无事件
- *   1 = 单击
- *   2 = 双击
- *   3 = 三击
- *   4 = 长按
+ * @return 事件编码（与 loop() 里的判断一一对应）：
+ *   0 = 无事件      1 = 单击        2 = 双击        3 = 三击
+ *   4 = 四连击（电池校准）         5 = 短长按(200-800ms，切搜索)
+ *   6 = 长按(>800ms，调音量)
  */
 int getButtonEvent(int buttonPin, unsigned long debounceTime = 50, 
                   unsigned long shortPressTime = 200,  
@@ -514,7 +530,7 @@ int getButtonEvent(int buttonPin, unsigned long debounceTime = 50,
 
 void savestation(int n)  //存储电台
 {
-  int addr_offset;
+  if (n < 1 || n > storenumber) return;
 
   EEPROM.begin(EEPROM_SIZE);
 
@@ -533,33 +549,52 @@ void savestation(int n)  //存储电台
 
 void readstation(int n)  //读取电台
 {
+  if (n < 1 || n > storenumber) return;
+
   EEPROM.begin(EEPROM_SIZE);
 
-  bandIdx = EEPROM.read(eeprom_address + 100 + n * 15 + 1);
-  currentMode = EEPROM.read(eeprom_address + 100 + n * 15 + 2);
-  band[bandIdx].currentFreq = EEPROM.read(eeprom_address + 100 + n * 15 + 3) << 8;
-  band[bandIdx].currentFreq |= EEPROM.read(eeprom_address + 100 + n * 15 + 4);
-  band[bandIdx].currentStepIdx = EEPROM.read(eeprom_address + 100 + n * 15 + 5);
-  band[bandIdx].bandwidthIdx = EEPROM.read(eeprom_address + 100 + n * 15 + 6);
-
+  int addr = eeprom_address + 100 + n * 15;
+  uint8_t bandByte = EEPROM.read(addr + 1);
+  uint8_t modeByte = EEPROM.read(addr + 2);
+  uint16_t freq = EEPROM.read(addr + 3) << 8;
+  freq |= EEPROM.read(addr + 4);
+  uint8_t step = EEPROM.read(addr + 5);
+  uint8_t bw = EEPROM.read(addr + 6);
 
   EEPROM.end();
+
+  // 逐项校验，脏数据不能让 band[255] / bandwidthAM[200] 这种越界访问发生
+  bandIdx = (bandByte > lastBand) ? 0 : bandByte;
+  currentMode = (modeByte > AM) ? FM : modeByte;
+
+  int8_t lastStep = (band[bandIdx].bandType == FM_BAND_TYPE) ? lastFmStep
+                  : (band[bandIdx].bandType == MW_BAND_TYPE) ? lastAmStep : lastSwStep;
+
+  if (freq >= band[bandIdx].minimumFreq && freq <= band[bandIdx].maximumFreq)
+    band[bandIdx].currentFreq = freq;
+  if ((int8_t)step >= 0 && (int8_t)step <= lastStep)
+    band[bandIdx].currentStepIdx = (int8_t)step;
+  if (bw <= maxAmBw)
+    band[bandIdx].bandwidthIdx = (int8_t)bw;
 
   currentFrequency = band[bandIdx].currentFreq;
 
   if (band[bandIdx].bandType == FM_BAND_TYPE) {
     currentStepIdx = idxFmStep = band[bandIdx].currentStepIdx;
     rx.setFrequencyStep(tabFmStep[currentStepIdx]);
-  } else {
+  } else if (band[bandIdx].bandType == MW_BAND_TYPE) {
     currentStepIdx = idxAmStep = band[bandIdx].currentStepIdx;
     rx.setFrequencyStep(tabAmStep[currentStepIdx]);
+  } else {
+    currentStepIdx = idxSwStep = band[bandIdx].currentStepIdx;
+    rx.setFrequencyStep(tabSwStep[currentStepIdx]);
   }
 
   int bwIdx = band[bandIdx].bandwidthIdx;
 
   if (currentMode == LSB || currentMode == USB) {
     loadSSB();
-    bwIdxSSB = (bwIdx > 5) ? 5 : bwIdx;
+    bwIdxSSB = (bwIdx > maxSsbBw) ? 0 : bwIdx;
     rx.setSSBAudioBandwidth(bandwidthSSB[bwIdxSSB].idx);
     // If audio bandwidth selected is about 2 kHz or below, it is recommended to set Sideband Cutoff Filter to 0.
     if (bandwidthSSB[bwIdxSSB].idx == 0 || bandwidthSSB[bwIdxSSB].idx == 4 || bandwidthSSB[bwIdxSSB].idx == 5)
@@ -568,17 +603,17 @@ void readstation(int n)  //读取电台
       rx.setSSBSidebandCutoffFilter(1);
     rx.setSSBBfo(currentBFO);
   } else if (currentMode == AM) {
-    bwIdxAM = bwIdx;
+    bwIdxAM = (bwIdx > maxAmBw) ? 0 : bwIdx;
     rx.setBandwidth(bandwidthAM[bwIdxAM].idx, 1);
   } else {
-    bwIdxFM = bwIdx;
+    bwIdxFM = (bwIdx > maxFmBw) ? 0 : bwIdx;
     rx.setFmBandwidth(bandwidthFM[bwIdxFM].idx);
   }
 
   if (currentBFO > 0)
-    sprintf(bfo, "+%4.4d", currentBFO);
+    snprintf(bfo, sizeof(bfo), "+%d", currentBFO);
   else
-    sprintf(bfo, "%4.4d", currentBFO);
+    snprintf(bfo, sizeof(bfo), "%d", currentBFO);
 
   useBand();
 
@@ -587,64 +622,91 @@ void readstation(int n)  //读取电台
 
 void saveAllReceiverInformation()  //writes the conrrent receiver information into the eeprom.
 {
-  int addr_offset;
-
   EEPROM.begin(EEPROM_SIZE);
 
   EEPROM.write(eeprom_address, app_id);              // stores the app id;
   EEPROM.write(eeprom_address + 1, rx.getVolume());  // stores the current Volume
   EEPROM.write(eeprom_address + 2, bandIdx);         // Stores the current band
   EEPROM.write(eeprom_address + 3, fmRDS);
-  EEPROM.write(eeprom_address + 4, currentMode);  // Stores the current Mode (FM / AM / SSB)
-  EEPROM.write(eeprom_address + 5, currentBFO >> 8);
-  EEPROM.write(eeprom_address + 6, currentBFO & 0XFF);
+  EEPROM.write(eeprom_address + 4, currentMode);     // Stores the current Mode (FM / AM / SSB)
+  EEPROM.write(eeprom_address + 5, (currentBFO >> 8) & 0xFF);
+  EEPROM.write(eeprom_address + 6, currentBFO & 0xFF);
   EEPROM.write(eeprom_address + 7, brightness);
   EEPROM.write(eeprom_address + 8, lcdofftime);
   EEPROM.write(eeprom_address + 9, cmdseek ? 1 : 0);  //存储 搜索
-  //if(!cmdseek) EEPROM.write(eeprom_address + 79,0);
-  //电池校准系数 10
+  EEPROM.write(eeprom_address + 12, agcIdx);          // AGC/衰减，原来不存，重启就回默认
+  EEPROM.write(eeprom_address + 13, softMuteMaxAttIdx);
 
-
-  EEPROM.commit();
-
-  addr_offset = 15;
   band[bandIdx].currentFreq = currentFrequency;
 
+  int addr_offset = 15;
   for (int i = 0; i <= lastBand; i++) {
     EEPROM.write(addr_offset++, (band[i].currentFreq >> 8));    // stores the current Frequency HIGH byte for the band
     EEPROM.write(addr_offset++, (band[i].currentFreq & 0xFF));  // stores the current Frequency LOW byte for the band
     EEPROM.write(addr_offset++, band[i].currentStepIdx);        // Stores current step of the band
     EEPROM.write(addr_offset++, band[i].bandwidthIdx);          // table index (direct position) of bandwidth
-    EEPROM.commit();
   }
 
+  // 只提交一次：原来在 for 里 commit 20 次，等于整页擦写 20 遍，很吃闪存寿命
+  EEPROM.commit();
   EEPROM.end();
 }
 
 void readAllReceiverInformation()  //reads the last receiver status from eeprom.
 {
   uint8_t volume;
-  int addr_offset;
   int bwIdx;
   EEPROM.begin(EEPROM_SIZE);
 
   volume = EEPROM.read(eeprom_address + 1);  // Gets the stored volume;
-  bandIdx = EEPROM.read(eeprom_address + 2);
-  fmRDS = EEPROM.read(eeprom_address + 3);
-  currentMode = EEPROM.read(eeprom_address + 4);
-  currentBFO = EEPROM.read(eeprom_address + 5) << 8;
-  currentBFO |= EEPROM.read(eeprom_address + 6);
-  brightness = EEPROM.read(eeprom_address + 7);
-  lcdofftime = EEPROM.read(eeprom_address + 8);
-  cmdseek = bool((EEPROM.read(eeprom_address + 9)));
-  //电池校准系数 10
 
-  addr_offset = 15;
+  // EEPROM 里的每个值都要校验。数据写坏时读出来是 255，
+  // 拿去索引 band[] / bandModeDesc[] / tabXxxStep[] 就是越界读写，直接崩。
+  uint8_t bandByte = EEPROM.read(eeprom_address + 2);
+  bandIdx = (bandByte > lastBand) ? 0 : bandByte;
+
+  uint8_t modeByte = EEPROM.read(eeprom_address + 4);
+  currentMode = (modeByte > AM) ? FM : modeByte;
+
+  fmRDS = (EEPROM.read(eeprom_address + 3) != 0);
+  currentBFO = (int16_t)((EEPROM.read(eeprom_address + 5) << 8) | EEPROM.read(eeprom_address + 6));
+
+  uint8_t brightByte = EEPROM.read(eeprom_address + 7);
+  brightness = (brightByte == 0) ? 50 : brightByte;
+
+  uint8_t lcdByte = EEPROM.read(eeprom_address + 8);
+  lcdofftime = (lcdByte > 99) ? 5 : lcdByte;
+
+  cmdseek = (EEPROM.read(eeprom_address + 9) != 0);
+
+  uint8_t agcByte = EEPROM.read(eeprom_address + 12);
+  if (agcByte <= 35) {
+    agcIdx = (int8_t)agcByte;
+    disableAgc = (agcIdx > 0);
+    agcNdx = (agcIdx > 1) ? (agcIdx - 1) : 0;
+  }
+
+  uint8_t muteByte = EEPROM.read(eeprom_address + 13);
+  softMuteMaxAttIdx = (muteByte > 32) ? 0 : (int8_t)muteByte;
+
+  int addr_offset = 15;
   for (int i = 0; i <= lastBand; i++) {
-    band[i].currentFreq = EEPROM.read(addr_offset++) << 8;
-    band[i].currentFreq |= EEPROM.read(addr_offset++);
-    band[i].currentStepIdx = EEPROM.read(addr_offset++);
-    band[i].bandwidthIdx = EEPROM.read(addr_offset++);
+    uint16_t freq = EEPROM.read(addr_offset++) << 8;
+    freq |= EEPROM.read(addr_offset++);
+    uint8_t step = EEPROM.read(addr_offset++);
+    uint8_t bw = EEPROM.read(addr_offset++);
+
+    // 频率不在本波段范围内 = 脏数据，保留代码里的默认值
+    if (freq >= band[i].minimumFreq && freq <= band[i].maximumFreq)
+      band[i].currentFreq = freq;
+
+    int8_t lastStep = (band[i].bandType == FM_BAND_TYPE) ? lastFmStep
+                    : (band[i].bandType == MW_BAND_TYPE) ? lastAmStep : lastSwStep;
+    if ((int8_t)step >= 0 && (int8_t)step <= lastStep)
+      band[i].currentStepIdx = (int8_t)step;
+
+    if (bw <= maxAmBw)  // maxAmBw 是三种带宽表里最大的下标
+      band[i].bandwidthIdx = (int8_t)bw;
   }
 
   EEPROM.end();
@@ -661,13 +723,12 @@ void readAllReceiverInformation()  //reads the last receiver status from eeprom.
     currentStepIdx = idxSwStep = band[bandIdx].currentStepIdx;
     rx.setFrequencyStep(tabSwStep[currentStepIdx]);
   }
-  
 
   bwIdx = band[bandIdx].bandwidthIdx;
 
   if (currentMode == LSB || currentMode == USB) {
     loadSSB();
-    bwIdxSSB = (bwIdx > 5) ? 5 : bwIdx;
+    bwIdxSSB = (bwIdx > maxSsbBw) ? 0 : bwIdx;
     rx.setSSBAudioBandwidth(bandwidthSSB[bwIdxSSB].idx);
     // If audio bandwidth selected is about 2 kHz or below, it is recommended to set Sideband Cutoff Filter to 0.
     if (bandwidthSSB[bwIdxSSB].idx == 0 || bandwidthSSB[bwIdxSSB].idx == 4 || bandwidthSSB[bwIdxSSB].idx == 5)
@@ -676,17 +737,17 @@ void readAllReceiverInformation()  //reads the last receiver status from eeprom.
       rx.setSSBSidebandCutoffFilter(1);
     rx.setSSBBfo(currentBFO);
   } else if (currentMode == AM) {
-    bwIdxAM = bwIdx;
+    bwIdxAM = (bwIdx > maxAmBw) ? 0 : bwIdx;
     rx.setBandwidth(bandwidthAM[bwIdxAM].idx, 1);
   } else {
-    bwIdxFM = bwIdx;
+    bwIdxFM = (bwIdx > maxFmBw) ? 0 : bwIdx;
     rx.setFmBandwidth(bandwidthFM[bwIdxFM].idx);
   }
 
   if (currentBFO > 0)
-    sprintf(bfo, "+%4.4d", currentBFO);
+    snprintf(bfo, sizeof(bfo), "+%d", currentBFO);  // 原来 %4.4d 会把 -120 打成 -0120
   else
-    sprintf(bfo, "%4.4d", currentBFO);
+    snprintf(bfo, sizeof(bfo), "%d", currentBFO);
 
   delay(50);
   rx.setVolume(volume);
@@ -724,7 +785,7 @@ void disableCommands()  //Set all command flags to false //When all flags are di
  * if you do not add ICACHE_RAM_ATTR declaration, the system will reboot during attachInterrupt call. 
  * With ICACHE_RAM_ATTR macro you put the function on the RAM.
  */
-ICACHE_RAM_ATTR void rotaryEncoder()  //编码器中断 // rotary encoder events
+ARDUINO_ISR_ATTR void rotaryEncoder()  //编码器中断 // rotary encoder events
 {
   uint8_t encoderStatus = encoder.process();
   if (encoderStatus)
@@ -767,9 +828,9 @@ void showBFO()  //Shows the current BFO value
 {
 
   if (currentBFO > 0)
-    sprintf(bfo, "+%4.4d", currentBFO);
+    snprintf(bfo, sizeof(bfo), "+%d", currentBFO);
   else
-    sprintf(bfo, "%4.4d", currentBFO);
+    snprintf(bfo, sizeof(bfo), "%d", currentBFO);
   drawSprite();
   elapsedCommand = millis();
 }
@@ -797,7 +858,7 @@ void useBand()  //Switch the radio to current band
     rx.setSeekFmSNRThreshold(2);   //增加fm搜索snr阈值   3-8
     rx.setSeekFmSpacing(10);
     bfoOn = ssbLoaded = false;
-    bwIdxFM = band[bandIdx].bandwidthIdx;
+    bwIdxFM = (band[bandIdx].bandwidthIdx > maxFmBw) ? 0 : band[bandIdx].bandwidthIdx;
     rx.setFmBandwidth(bandwidthFM[bwIdxFM].idx);
     rx.setFMDeEmphasis(1);
     rx.RdsInit();
@@ -805,17 +866,19 @@ void useBand()  //Switch the radio to current band
   } else if (band[bandIdx].bandType == SW_BAND_TYPE) {
     // set the tuning capacitor for SW or MW/LW 只留下sw
     rx.setTuneFrequencyAntennaCapacitor(1);  //( band[bandIdx].bandType == MW_BAND_TYPE ||band[bandIdx].bandType == LW_BAND_TYPE) ? 0 : 1
-    if (ssbLoaded) {
+    // 只有当前模式真的是 LSB/USB 才走 SSB。原来只看 ssbLoaded：
+    // 从 MW（会被强制成 AM）切回 SW 时 ssbLoaded 还是 true，于是用 AM 去调 setSSB，界面写 AM 实际出 LSB。
+    if (ssbLoaded && (currentMode == LSB || currentMode == USB)) {
       rx.setSSB(band[bandIdx].minimumFreq, band[bandIdx].maximumFreq, band[bandIdx].currentFreq, tabSwStep[band[bandIdx].currentStepIdx], currentMode);
       rx.setSSBAutomaticVolumeControl(1);
       rx.setSsbSoftMuteMaxAttenuation(softMuteMaxAttIdx);  // Disable Soft Mute for SSB
-      bwIdxSSB = band[bandIdx].bandwidthIdx;
+      bwIdxSSB = (band[bandIdx].bandwidthIdx > maxSsbBw) ? 0 : band[bandIdx].bandwidthIdx;
       rx.setSSBAudioBandwidth(bandwidthSSB[bwIdxSSB].idx);
     } else {
       currentMode = AM;
       rx.setAM(band[bandIdx].minimumFreq, band[bandIdx].maximumFreq, band[bandIdx].currentFreq, tabSwStep[band[bandIdx].currentStepIdx]);
       bfoOn = false;
-      bwIdxAM = band[bandIdx].bandwidthIdx;
+      bwIdxAM = (band[bandIdx].bandwidthIdx > maxAmBw) ? 0 : band[bandIdx].bandwidthIdx;
       rx.setBandwidth(bandwidthAM[bwIdxAM].idx, 1);
       rx.setAmSoftMuteMaxAttenuation(softMuteMaxAttIdx);  // Soft Mute for AM or SSB
     }
@@ -830,7 +893,7 @@ void useBand()  //Switch the radio to current band
     currentMode = AM;
     rx.setAM(band[bandIdx].minimumFreq, band[bandIdx].maximumFreq, band[bandIdx].currentFreq, tabAmStep[band[bandIdx].currentStepIdx]);
     bfoOn = false;
-    bwIdxAM = band[bandIdx].bandwidthIdx;
+    bwIdxAM = (band[bandIdx].bandwidthIdx > maxAmBw) ? 0 : band[bandIdx].bandwidthIdx;
     rx.setBandwidth(bandwidthAM[bwIdxAM].idx, 1);
     rx.setAmSoftMuteMaxAttenuation(softMuteMaxAttIdx);  // Soft Mute for AM or SSB
     ///////////////////////////////
@@ -1046,8 +1109,9 @@ int readsavednumcount(void)  //将存储的电台号码读取进 station[]数组
   for (int i = 1; i <= storenumber; i++) {
     value = EEPROM.read(eeprom_address + 100 + i * 15 + 7);  //将存储的savenum 读取出
 
-    if (value != 255)  //初始化默认255
-    {
+    // 255 是空槽；以外的越界值（脏数据）也要丢掉，否则 station[] 里会存进非法号码，
+    // 后面 readstation(station[n]) 就会拿它去索引 band[]
+    if (value >= 1 && value <= storenumber) {
       count_station++;
       station[count_station] = value;
     }
@@ -1058,18 +1122,23 @@ int readsavednumcount(void)  //将存储的电台号码读取进 station[]数组
 
 void doselstation(int8_t v)  //读取电台设置 selnum
 {
-  if (v == -1) selnum++;
-  if (selnum > readsavednumcount()) selnum = 1;
-  else if (v == 1) selnum--;
-  if (selnum < 1) selnum = readsavednumcount();
+  int count = readsavednumcount();  // 原来一次调用读 3 遍 EEPROM（每遍 50 次读），旋钮明显发涩
+  if (count <= 0) {
+    selnum = 1;
+    return;
+  }
 
-  //  tft.drawString(String(readsavednumcount()),160,102,4);  //在rds位置显示调试数据
-  //  tft.drawString(String(station[selnum]),190,102,4);  //在rds位置显示调试数据
+  if (v == -1) {
+    if (++selnum > count) selnum = 1;
+  } else if (v == 1) {
+    if (--selnum < 1) selnum = count;
+  }
+
+  if (selnum < 1 || selnum > count) selnum = 1;  // station[] 只有 1..count 有效
 
   readstation(station[selnum]);
 
   drawSprite();
-
 }
 
 void dosavestation(int8_t v)  //保存电台设置 savenum
@@ -1083,14 +1152,9 @@ void dosavestation(int8_t v)  //保存电台设置 savenum
   drawSprite();
 }
 
-void doabout(int8_t v)  //关于 屏幕刷新会刷新掉 暂时添加延时
+void doabout(int8_t v)  //关于
 {
-  if (v == 1) {
-  } else {
-  }
-  //spr.createSprite(320, 170);
   spr.fillSprite(TFT_BLACK);
-  //spr.setTextColor(TFT_WHITE, TFT_BLACK);
   spr.setTextDatum(ML_DATUM);
   spr.loadFont(HanYiZhongYuanJian16);
 
@@ -1099,37 +1163,38 @@ void doabout(int8_t v)  //关于 屏幕刷新会刷新掉 暂时添加延时
   spr.drawString("软件 汉化 改进 :zooc", 1, 50);
   spr.drawString(" ", 1, 70);
   spr.drawString("QQ群:854656412", 1, 90);
-  spr.drawFloat(CONV_FACTOR,10, 100,130);
+  spr.drawFloat(CONV_FACTOR, 10, 100, 130);
 
   spr.unloadFont();
 
-  spr.pushSprite(0, 0); 
-  while (digitalRead(21));
+  spr.pushSprite(0, 0);
+
+  // 等松手，但最多 3 秒。原来 while (digitalRead(21)); 按键卡住就整机挂死
+  unsigned long start = millis();
+  while (digitalRead(ENCODER_PUSH_BUTTON) && (millis() - start) < 3000UL) {
+    delay(10);
+  }
 }
 
 void dobright(int8_t v)  //调节亮度
 {
+  // brightness 是 unsigned char：1-5 会回绕成 252，最暗直接跳最亮。
+  // 先算到 int 上再钳位，最后才写回。
+  int next = (int)brightness + ((v == 1) ? -5 : 5);
+  if (next < 1) next = 1;
+  if (next > 255) next = 255;
+  brightness = (unsigned char)next;
 
-  if (brightness < 1) { brightness = 1; }
-  if (brightness > 255) { brightness = 255; }
-
-  if (v == 1) {
-    brightness = brightness - 5;
-    ledcWrite(0, brightness);
-    drawSprite();
-
-  } else {
-    brightness = brightness + 5;
-    ledcWrite(0, brightness);
-    drawSprite();
-  }
+  ledcWrite(LEDC_BL_CH, brightness);
+  drawSprite();
 }
 
-void sellcdofftime(int8_t v)  //自动熄屏时间调节 0-99
+void sellcdofftime(int8_t v)  //自动熄屏时间调节 0-99，0 = 关闭自动熄屏
 {
   if (v == -1) lcdofftime++;
-  if (lcdofftime > 99) lcdofftime = 1;
   else if (v == 1) lcdofftime--;
+
+  if (lcdofftime > 99) lcdofftime = 0;  // 99 之后回到 0（关闭），原来钳成 1 导致永远关不掉
   if (lcdofftime < 0) lcdofftime = 99;
 
   drawSprite();
@@ -1138,7 +1203,8 @@ void sellcdofftime(int8_t v)  //自动熄屏时间调节 0-99
 void checkScreenTimeout()  //检查屏幕超时 如果超过自动熄屏时间 熄屏 在按键编码器事件中通过 lcdoff(false)复位
 {
   unsigned long currentTime = millis();
-  if (lcdofftime != 0 && (currentTime - lastActiveTime > lcdofftime * 1000)) {  //lcdoff(false) &&
+  if (lcdofftime != 0 && !lcdoffed &&
+      (currentTime - lastActiveTime > (unsigned long)lcdofftime * 1000UL)) {
     lcdoff(true);
   }
 }
@@ -1146,13 +1212,13 @@ void checkScreenTimeout()  //检查屏幕超时 如果超过自动熄屏时间 �
 void lcdoff(bool off)  //控制屏幕亮灭 控制lcdoffed变量
 {
   if (off) {
-    ledcWrite(0, 0); //背光关闭
+    ledcWrite(LEDC_BL_CH, 0); //背光关闭
     //digitalWrite(TFT_PWR, LOW);
     //adc_digi_stop();
     lcdoffed = true;
   }  //关闭背光
   else {
-    ledcWrite(0, brightness);
+    ledcWrite(LEDC_BL_CH, brightness);
     //adc_digi_start();
     //pinMode(21, INPUT_PULLUP);
     delay(200);        //if (currentTime  - lcdondelaytime >1000 )
@@ -1168,7 +1234,7 @@ void showFrequencySeek(uint16_t freq)  //显示频率 This function is called by
 
 bool stopseek()  //seekStationProgress 回调函数 用于停止搜索
 {
-  if ((encoderCount == 1 & seekDirection == 1) | (encoderCount == -1 & seekDirection == 0))  //如果编码器方向和搜索方向不一致
+  if (((encoderCount == 1) && (seekDirection == 1)) || ((encoderCount == -1) && (seekDirection == 0)))  //如果编码器方向和搜索方向不一致
   {
     return true;  //返回真 停止搜索
   }
@@ -1314,41 +1380,40 @@ bool isMenuMode()  //Return true if the current status is Menu command
 }
 
 uint8_t getStrength() {
+  // 原来是一长串 if，末尾没有 return：AM 下 rssi==2、FM 下 rssi==1 会落空，
+  // 返回值是寄存器残留 -> 信号条格数随机跳。改成逐级 <= 判断，保证每个值都有返回值。
+  uint8_t r = rssi;
+
   if (currentMode != FM) {
-    //dBuV to S point conversion HF
-    if ((rssi >= 0) and (rssi <= 1)) return 1;    // S0
-    if ((rssi > 1) and (rssi <= 1)) return 2;     // S1
-    if ((rssi > 2) and (rssi <= 3)) return 3;     // S2
-    if ((rssi > 3) and (rssi <= 4)) return 4;     // S3
-    if ((rssi > 4) and (rssi <= 10)) return 5;    // S4
-    if ((rssi > 10) and (rssi <= 16)) return 6;   // S5
-    if ((rssi > 16) and (rssi <= 22)) return 7;   // S6
-    if ((rssi > 22) and (rssi <= 28)) return 8;   // S7
-    if ((rssi > 28) and (rssi <= 34)) return 9;   // S8
-    if ((rssi > 34) and (rssi <= 44)) return 10;  // S9
-    if ((rssi > 44) and (rssi <= 54)) return 11;  // S9 +10
-    if ((rssi > 54) and (rssi <= 64)) return 12;  // S9 +20
-    if ((rssi > 64) and (rssi <= 74)) return 13;  // S9 +30
-    if ((rssi > 74) and (rssi <= 84)) return 14;  // S9 +40
-    if ((rssi > 84) and (rssi <= 94)) return 15;  // S9 +50
-    if (rssi > 94) return 16;                     // S9 +60
-    if (rssi > 95) return 17;                     //>S9 +60
-  } else {
-    //dBuV to S point conversion FM
-    if (rssi < 1) return 1;
-    if ((rssi > 1) and (rssi <= 2)) return 7;     // S6
-    if ((rssi > 2) and (rssi <= 8)) return 8;     // S7
-    if ((rssi > 8) and (rssi <= 14)) return 9;    // S8
-    if ((rssi > 14) and (rssi <= 24)) return 10;  // S9
-    if ((rssi > 24) and (rssi <= 34)) return 11;  // S9 +10
-    if ((rssi > 34) and (rssi <= 44)) return 12;  // S9 +20
-    if ((rssi > 44) and (rssi <= 54)) return 13;  // S9 +30
-    if ((rssi > 54) and (rssi <= 64)) return 14;  // S9 +40
-    if ((rssi > 64) and (rssi <= 74)) return 15;  // S9 +50
-    if (rssi > 74) return 16;                     // S9 +60
-    if (rssi > 76) return 17;                     //>S9 +60
-    // newStereoPilot=si4735.getCurrentPilot();
+    if (r <= 1)  return 1;   // S0
+    if (r <= 2)  return 2;   // S1（原来写成 rssi>1 && rssi<=1，恒假）
+    if (r <= 3)  return 3;   // S2
+    if (r <= 4)  return 4;   // S3
+    if (r <= 10) return 5;   // S4
+    if (r <= 16) return 6;   // S5
+    if (r <= 22) return 7;   // S6
+    if (r <= 28) return 8;   // S7
+    if (r <= 34) return 9;   // S8
+    if (r <= 44) return 10;  // S9
+    if (r <= 54) return 11;  // S9+10
+    if (r <= 64) return 12;  // S9+20
+    if (r <= 74) return 13;  // S9+30
+    if (r <= 84) return 14;  // S9+40
+    if (r <= 94) return 15;  // S9+50
+    return 16;               // S9+60
   }
+
+  if (r < 1)   return 1;
+  if (r <= 2)  return 7;     // S6
+  if (r <= 8)  return 8;     // S7
+  if (r <= 14) return 9;     // S8
+  if (r <= 24) return 10;    // S9
+  if (r <= 34) return 11;    // S9+10
+  if (r <= 44) return 12;    // S9+20
+  if (r <= 54) return 13;    // S9+30
+  if (r <= 64) return 14;    // S9+40
+  if (r <= 74) return 15;    // S9+50
+  return 16;                 // S9+60
 }
 
 void drawMenu() {
@@ -1387,10 +1452,13 @@ void drawMenu() {
     for (int i = -2; i < 3; i++) {
       if (i == 0) spr.setTextColor(0xBEDF, 0x105B);
       else spr.setTextColor(0xBEDF, TFT_MENU_BACK);
-      if (cmdMode)
+      if (cmdMode) {
         if (band[bandIdx].bandType == FM_BAND_TYPE) {
           if (i == 0) spr.drawString(bandModeDesc[abs((currentMode + lastBandModeDesc + 1 + i) % (lastBandModeDesc + 1))], 38, 64 + (i * 16), 2);
-        } else spr.drawString(bandModeDesc[abs((currentMode + lastBandModeDesc + 1 + i) % (lastBandModeDesc + 1))], 38, 64 + (i * 16), 2);
+        } else {
+          spr.drawString(bandModeDesc[abs((currentMode + lastBandModeDesc + 1 + i) % (lastBandModeDesc + 1))], 38, 64 + (i * 16), 2);
+        }
+      }
 
 
 
@@ -1410,7 +1478,7 @@ void drawMenu() {
           // bw = (char *)bandwidthSSB[bwIdxSSB].desc;
           // showBFO();
         } 
-        if (band[bandIdx].bandType == MW_BAND_TYPE || SW_BAND_TYPE) {
+        if (band[bandIdx].bandType == MW_BAND_TYPE || band[bandIdx].bandType == SW_BAND_TYPE) {
           spr.drawString(bandwidthAM[abs((bwIdxAM + lastBandwidthAM + 1 + i) % (lastBandwidthAM + 1))].desc, 38, 64 + (i * 16), 2);
         } 
          if (band[bandIdx].bandType == FM_BAND_TYPE){
@@ -1588,7 +1656,8 @@ void drawSprite() {
     spr.setTextDatum(MC_DATUM);
   }
 
-  for (int i = 0; i < getStrength(); i++)                                           //信号强度
+  uint8_t signalBars = getStrength();                                               //信号强度
+  for (int i = 0; i < signalBars; i++)
     if (i < 10) spr.fillRect(250 + (i * 2), leftrect_y+16+space - (i * 1), 2, 4 + (i * 1), 0x3526);  //信号强度
     else spr.fillRect(250 + (i * 2), leftrect_y+16+space - (i * 1), 2, 4 + (i * 1), TFT_RED);
     
@@ -1718,9 +1787,11 @@ void cleanBfoRdsInfo() {
 }
 
 void showRDSMsg() {
-  rdsMsg[35] = bufferRdsMsg[35] = '\0';
-  if (strcmp(bufferRdsMsg, rdsMsg) == 0)
-    return;
+  if (rdsMsg == NULL) return;
+  // 不能写 rdsMsg[35]：那是 SI4735 库内部的缓冲，等于往别人的内存里插 '\0'
+  if (strncmp(bufferRdsMsg, rdsMsg, sizeof(bufferRdsMsg) - 1) == 0) return;
+  strncpy(bufferRdsMsg, rdsMsg, sizeof(bufferRdsMsg) - 1);
+  bufferRdsMsg[sizeof(bufferRdsMsg) - 1] = '\0';
 }
 
 void showRDSStation() {
@@ -1731,8 +1802,10 @@ void showRDSStation() {
 }
 
 void showRDSTime() {
-  if (strcmp(bufferRdsTime, rdsTime) == 0)
-    return;
+  if (rdsTime == NULL) return;
+  if (strncmp(bufferRdsTime, rdsTime, sizeof(bufferRdsTime) - 1) == 0) return;
+  strncpy(bufferRdsTime, rdsTime, sizeof(bufferRdsTime) - 1);
+  bufferRdsTime[sizeof(bufferRdsTime) - 1] = '\0';
 }
 
 void checkRDS() {
@@ -1752,37 +1825,18 @@ void checkRDS() {
 
 void DrawBatteryLevel(int batteryLevel)  //电量图标绘制
 {
+  int chargeLevel = 3;                  // 原来未初始化：batteryLevel 不在 1-7 时会用到随机值
+  uint16_t batteryLevelColor = TFT_RED;
 
-  int chargeLevel;
-  uint16_t batteryLevelColor;
-
-  if (batteryLevel == 1) {
-    chargeLevel = 3;
-    batteryLevelColor = TFT_RED;
-  }
-  if (batteryLevel == 2) {
-    chargeLevel = 5;
-    batteryLevelColor = TFT_YELLOW;
-  }
-  if (batteryLevel == 3) {
-    chargeLevel = 9;
-    batteryLevelColor = TFT_YELLOW;
-  }
-  if (batteryLevel == 4) {
-    chargeLevel = 12;
-    batteryLevelColor = TFT_GREEN;
-  }
-  if (batteryLevel == 5) {
-    chargeLevel = 15;
-    batteryLevelColor = TFT_GREEN;
-  }
-  if (batteryLevel == 6) {
-    chargeLevel = 18;
-    batteryLevelColor = TFT_GREEN;
-  }
-  if (batteryLevel == 7) {
-    chargeLevel = 18;
-    batteryLevelColor = TFT_BLUE;
+  switch (batteryLevel) {
+    case 1: chargeLevel = 3;  batteryLevelColor = TFT_RED;    break;
+    case 2: chargeLevel = 5;  batteryLevelColor = TFT_YELLOW; break;
+    case 3: chargeLevel = 9;  batteryLevelColor = TFT_YELLOW; break;
+    case 4: chargeLevel = 12; batteryLevelColor = TFT_GREEN;  break;
+    case 5: chargeLevel = 15; batteryLevelColor = TFT_GREEN;  break;
+    case 6: chargeLevel = 18; batteryLevelColor = TFT_GREEN;  break;
+    case 7: chargeLevel = 18; batteryLevelColor = TFT_BLUE;   break;
+    default: break;
   }
 
   spr.drawRect(XbatPos, YbatPos, Xbatsiz, Ybatsiz, TFT_WHITE);
@@ -1790,53 +1844,45 @@ void DrawBatteryLevel(int batteryLevel)  //电量图标绘制
   spr.fillRect(XbatPos + 1, YbatPos + 1, chargeLevel, Ybatsiz - 2, batteryLevelColor);  //电池图标x 18个像素
   spr.fillRect(XbatPos + 20, YbatPos + 2, 2, 5, TFT_WHITE);
 
-
-  spr.pushSprite(0, 0);
+  // 这里不再 pushSprite：由 drawSprite() 末尾统一推一次，
+  // 原来这里推一次、drawSprite 再推一次，每帧要刷两遍 106KB。
 }
 
 void batteryMonitor(bool forced)  //电池百分比 电池电压等级
 {
-  bool chargechanged = false;
-  if(batteryCharging!=chargechanged) chargechanged=true;  //判断充电状态是不是改变
-  else chargechanged=false;
+  unsigned long currentTime = millis();
 
-  unsigned long currentTime = millis();      // 获取当前时间
-  if (currentTime - lastSampleTime >= 30000 | chargechanged )  //每30秒读取一次电量百分比 减少跳动 拔下充电器 立即采样
-  {
-    batteryLevel = getBatteryChargeLevel(CONV_FACTOR);  // 执行采样操作 setup增加一次 否则开机5s无电量百分比
-    lastSampleTime = currentTime;                    // 更新最后一次采样时间
+  // 采一次就够：既用来判断有没有插 USB，也用来判断充电状态有没有变化
+  double volts = getBatteryVolts(CONV_FACTOR, !lcdoffed);
+  bool usb = (volts >= MIN_USB_VOLTAGE);
+  bool chargingChanged = (usb != batteryCharging);  // 原来写的是和 false 比，充电中恒真 -> 每帧采 20 次 ADC
+
+  // 正常 30 秒更新一次百分比；插拔充电器的瞬间补采一次，避免读数滞后
+  if (currentTime - lastSampleTime >= 30000UL || chargingChanged) {
+    batteryLevel = getBatteryChargeLevel(CONV_FACTOR);
+    lastSampleTime = currentTime;
   }
 
-  if (getBatteryVolts(CONV_FACTOR,!lcdoffed) >= MIN_USB_VOLTAGE) {
-    if (!batteryCharging or forced) {
-      batteryCharging = true;  //充电中 可以增加充电图标
-      DrawBatteryLevel(7);
-    }
-  } else {
-    batteryCharging = false;
+  if (usb) {
+    batteryCharging = true;
+    DrawBatteryLevel(7);  //充电图标
+    return;
+  }
 
-    if (batteryLevel > 100) {
-      currentBatteryLevel = 7;
-    } else if (batteryLevel >= 90) {
-      currentBatteryLevel = 6;
-    } else if (batteryLevel >= 75) {
-      currentBatteryLevel = 5;
-    } else if (batteryLevel >= 60) {
-      currentBatteryLevel = 4;
-    } else if (batteryLevel >= 45) {
-      currentBatteryLevel = 3;
-    } else if (batteryLevel >= 30) {
-      currentBatteryLevel = 2;
-    } else if (batteryLevel >= 15) {
-      currentBatteryLevel = 2;
-    } else if (batteryLevel <= 5) {
-      currentBatteryLevel = 1;
-    }
-    
-    if (currentBatteryLevel != previousBatteryLevel or forced) {
-      DrawBatteryLevel(currentBatteryLevel);
-      previousBatteryLevel = currentBatteryLevel;
-    }
+  batteryCharging = false;
+
+  if (batteryLevel > 100)      currentBatteryLevel = 7;
+  else if (batteryLevel >= 90) currentBatteryLevel = 6;
+  else if (batteryLevel >= 75) currentBatteryLevel = 5;
+  else if (batteryLevel >= 60) currentBatteryLevel = 4;
+  else if (batteryLevel >= 45) currentBatteryLevel = 3;
+  else if (batteryLevel >= 30) currentBatteryLevel = 2;
+  else if (batteryLevel >= 15) currentBatteryLevel = 2;
+  else                         currentBatteryLevel = 1;  // 原来 6-14% 没有任何分支，图标停在上一次的值
+
+  if (currentBatteryLevel != previousBatteryLevel || forced) {
+    DrawBatteryLevel(currentBatteryLevel);
+    previousBatteryLevel = currentBatteryLevel;
   }
   yield();
 }
@@ -1863,20 +1909,48 @@ void loop() {
 
  if (lcdoffed) //熄屏进入浅睡眠
  {
-    tft.writecommand(0x10); //屏幕睡眠
-    setCpuFrequencyMhz(80);
-    //配置唤醒源，当引脚检测到高电平时唤醒
-    pinMode(1, INPUT_PULLUP); // 启用内部上拉电阻
-    //pinMode(2, INPUT_PULLUP); // 启用内部上拉电阻
-    //(1ULL << BUTTON1_PIN) | (1ULL << BUTTON2_PIN)
-    //esp_sleep_enable_ext1_wakeup( (1ULL << GPIO_NUM_1) | (1ULL << GPIO_NUM_2), ESP_EXT1_WAKEUP_ANY_LOW);
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, LOW);
+    // 只在刚熄屏时切时钟、发 SLPIN，别每圈都发
+    if (!screenAsleep) {
+      tft.writecommand(0x10); //屏幕睡眠
+      setCpuFrequencyMhz(80);
+      screenAsleep = true;
+    }
+
+    // 唤醒源：编码器 A 相、B 相、编码器按键，任意一个被拉低都唤醒。
+    // 原来只挂了 B 相(ext0)，熄屏后按一下按键是叫不醒的 —— 浅睡期间普通
+    // attachInterrupt 不工作，GPIO21 不在唤醒源里。
+    pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+    pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+    pinMode(ENCODER_PUSH_BUTTON, INPUT_PULLUP);
+    rtc_gpio_pullup_en((gpio_num_t)ENCODER_PIN_A);       // 进浅睡后 GPIO 矩阵的上拉不保持，要配 RTC 域
+    rtc_gpio_pullup_en((gpio_num_t)ENCODER_PIN_B);
+    rtc_gpio_pullup_en((gpio_num_t)ENCODER_PUSH_BUTTON);
+
+    esp_sleep_enable_ext1_wakeup((1ULL << ENCODER_PIN_A) |
+                                 (1ULL << ENCODER_PIN_B) |
+                                 (1ULL << ENCODER_PUSH_BUTTON),
+                                 ESP_EXT1_WAKEUP_ANY_LOW);
+
+    unsigned long beforeSleep = millis();
     esp_light_sleep_start();
+
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+      // 是编码器或按键把人叫醒的，就直接亮屏，别让用户再转一下
+      lastActiveTime = millis();
+      lcdoff(false);
+    } else if (millis() - beforeSleep < 10) {
+      // 唤醒条件已经满足时 esp_light_sleep_start() 会立刻返回（比如按键一直按着），
+      // 这里兜个底，免得变成 80MHz 空转
+      delay(30);
+    }
  }
  else
  {
-    tft.writecommand(0x11); // 退出睡眠
-    setCpuFrequencyMhz(240);
+    if (screenAsleep) {
+      tft.writecommand(0x11); // 退出睡眠
+      setCpuFrequencyMhz(240);
+      screenAsleep = false;
+    }
  }
   
   event = getButtonEvent(21);
@@ -1935,23 +2009,31 @@ void loop() {
   
   if(event == 4)
   {
-    CONV_FACTOR = CONV_FACTOR * (4.2/getBatteryVolts(CONV_FACTOR,true)) ;    //重新计算系数CONV_FACTOR
+    // 四连击 = 电池电压校准。必须挡住异常读数：ADC 读到 0 时 4.2/V 变成 inf，
+    // 再乘上原系数写进 EEPROM，这台机器的电量显示就永久废了。
+    double volts = getBatteryVolts(CONV_FACTOR, true);
+    if (volts > 3.0 && volts < 4.6) {
+      double factor = CONV_FACTOR * (4.2 / volts);
+      if (factor > 1.0 && factor < 3.0) {         // 合理范围之外的系数一律不写
+        CONV_FACTOR = factor;
+        uint16_t stored = (uint16_t)(CONV_FACTOR * 1000);
 
-    EEPROM.begin(EEPROM_SIZE);
-    EEPROM.write(eeprom_address+10, int((CONV_FACTOR*1000))  >> 8 );              // 存储系数高八位
-    EEPROM.write(eeprom_address+11, int((CONV_FACTOR*1000))  &0xFF);              // 存储系数低八位
-    EEPROM.commit(); 
-    //delay(50); 
-    EEPROM.end();
-     
-    tft.drawString(String(getBatteryVolts(CONV_FACTOR,true),3),0,100,2);  //显示校准后电压
-    tft.drawString(String(CONV_FACTOR),40,100,2); //显示校准后系数
-    
+        EEPROM.begin(EEPROM_SIZE);
+        EEPROM.write(eeprom_address + 10, stored >> 8);     // 存储系数高八位
+        EEPROM.write(eeprom_address + 11, stored & 0xFF);   // 存储系数低八位
+        EEPROM.commit();
+        EEPROM.end();
+      }
+    }
+
+    tft.drawString(String(getBatteryVolts(CONV_FACTOR, true), 3), 0, 100, 2);  //显示校准后电压
+    tft.drawString(String(CONV_FACTOR), 40, 100, 2);                           //显示校准后系数
+    lastActiveTime = millis();   // 别让它刚校完就熄屏
   }
 
-  if (event == 5)  // 长按
+  if (event == 5)  // 短长按：切搜索/频率
   {
-    lcdoff(false);
+    if (lcdoffed) lcdoff(false);  // 原来无条件调用，亮屏时每次都要白等 200ms
     if ((currentMode == LSB || currentMode == USB)) cmdseek = false;
     else { cmdseek = !cmdseek; }
     drawSprite();
@@ -1996,13 +2078,13 @@ void loop() {
     else if (cmdbright) dobright(encoderCount);
     else if (cmdsave) dosavestation(encoderCount);
     else if (cmdautolcdoff) sellcdofftime(encoderCount);
-    else if (cmdselstation & !lcdoffed) doselstation(encoderCount);
-    else if (cmdseek & !lcdoffed) doSeek(encoderCount);
+    else if (cmdselstation && !lcdoffed) doselstation(encoderCount);
+    else if (cmdseek && !lcdoffed) doSeek(encoderCount);
     else {
       //autostep();  //自动步进 临时测试 未优化
 
-      if (encoderCount == 1 & !lcdoffed) rx.frequencyDown();
-      else if (encoderCount == -1 & !lcdoffed) rx.frequencyUp();
+      if (encoderCount == 1 && !lcdoffed) rx.frequencyDown();
+      else if (encoderCount == -1 && !lcdoffed) rx.frequencyUp();
 
       if (currentMode == FM) cleanBfoRdsInfo();
       // Show the current frequency only if it has changed

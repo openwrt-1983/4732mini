@@ -14,29 +14,19 @@
 
 double getBatteryVolts(double conversionFactor, bool enable)  //加入double conversionFactor 参数 读取电压是重置 系数
 {
-   int totalValue = 0;
-   
-   if (enable) 
-   {
-    for (int i = 0; i < READS; i++) {
+  // 熄屏时不再采样。原来这条分支没有 return，返回值是寄存器里的残留，
+  // 有可能 >4.35V，于是被误判成“插着 USB”，一直显示充电图标。
+  if (!enable) return 0;
+
+  int totalValue = 0;
+  for (int i = 0; i < READS; i++) {
     totalValue += analogRead(ADCPIN);
-    }
-    double FACTOR = conversionFactor;  //重置之后赋值 
+  }
 
-    return ((int)(totalValue/READS))  * FACTOR / 1000;
-     
-   }
-   else
-   {
-   //pinMode(ADCPIN, INPUT);
-   //adc_power_off();
-   //adc_power_release();
-   //stopADC(ADCPIN);
-   //analogRead(11);
-   }
-    
+  int raw = totalValue / READS;
+  if (raw <= 0) return 0;  // ADC 没读到时不能给出假电压（校准时 4.2/0 会把系数写成 inf）
 
-  
+  return raw * conversionFactor / 1000;
 }
 
 // void stopADC(uint8_t pin) {
