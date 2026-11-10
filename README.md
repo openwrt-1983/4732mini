@@ -7,7 +7,7 @@
 - 原作者：**zhang-chong**（老张）
 - 本仓库基于上游提交 `5334e7b`（2026-03-07，`Create CNAME`）派生
 - 原作者声明：**仅供学习交流使用，请勿用作商业用途**。如有改进希望回馈上游，一起优化。
-- 本仓库只做了一件事：在原作者代码基础上修 bug，并编译验证通过。功能、界面、交互全部沿用原设计，没有新增功能。
+- 本仓库做了两件事：① 在原作者代码基础上修 bug（根目录这版，界面交互全部沿用原设计）；② 另外派生了一套 LVGL 界面版（`4732mini-lvgl/`，业务层同源、界面层重画，见文末）。
 
 如果你要找的是原始项目、最新版或想给作者提改进，请去上面的原地址。
 
@@ -97,3 +97,86 @@ arduino-cli compile -b esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=huge_ap
 - 熄屏后的电池电流（应降到个位数 mA）
 - 熄屏状态下**按一下按键**能否亮屏，以及旋钮唤醒是否即时
 - 电量百分比（esp32 core 3.x 的 ADC 实现与 2.x 略有差异，若偏几个点，摇一次四连击重新校准即可）
+
+---
+
+# LVGL 界面版（`4732mini-lvgl/`）
+
+同一块板子、同一套业务代码，界面改用 **LVGL 9.2.2** 重画。
+
+## 和根目录这版的关系
+
+- **业务层同源**：`4732mini-lvgl.ino` 从 `ALL_IN_ONE_T-Display_S3.ino` 派生。调谐、波段、SSB 补丁、EEPROM 记忆、编码器、电池这些逻辑原样保留，上面 19 条修复也全部在内。
+- **界面层重写**：原版 200 多处直接 `spr.drawSprite()` 的像素绘制全部删除，改由 `ui_lvgl.cpp` 用 LVGL 对象绘制。`drawSprite()` 只负责把当前频率 / 信号 / 音量 / 电量 / 菜单打包成 `UiState` 交给 `uiUpdate()`，界面层不碰业务全局变量。
+- 两版并存、互不影响：根目录仍是「原版界面 + 修 bug」，`4732mini-lvgl/` 是新界面。
+
+## 目录
+
+```
+4732mini-lvgl/
+  4732mini-lvgl.ino     业务层（派生自根目录 .ino，去掉绘图）
+  ui_lvgl.h / .cpp      界面层（LVGL 对象、布局、配色）
+  font_big.h            Anton 57  频率大字
+  font_mid.h            Anton 24  MHz / 中号
+  font_cap.h            Anton 17  胶囊文字
+  font_num.h            Anton 15  刻度数字
+  font_cn.h             微米黑 18 加粗  状态行 / 菜单
+  font_cn16.h           微米黑 16  次级中文
+  Battery.* Rotary.* patch_init.h icon.h   与根目录同源
+  lv_conf.h.example     lv_conf 模板
+  build.sh              编译脚本
+```
+
+## 依赖
+
+| 项 | 说明 |
+|---|---|
+| LVGL | **9.2.2**，装在 `$HOME/Arduino/libraries/lvgl` |
+| lv_conf.h | 复制 `4732mini-lvgl/lv_conf.h.example` 到 `$HOME/Arduino/libraries/lv_conf.h`，关键项：`LV_COLOR_DEPTH 16`、`LV_USE_STDLIB_MALLOC LV_STDLIB_CLIB`、`LV_FONT_SIMSUN_16_CJK 1` |
+| TFT_eSPI | 仍用仓库自带的 `libraries/TFT_eSPI_DynamicSpeed`（8 位并行 Setup206），**不要装官方库** |
+
+## 编译
+
+```bash
+./4732mini-lvgl/build.sh
+```
+
+手工等价命令：
+
+```bash
+arduino-cli compile -b esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=huge_app \
+  --libraries <本仓库>/libraries \
+  --build-path ~/build-4732/out-lvgl \
+  --output-dir <本仓库>/out-lvgl \
+  4732mini-lvgl
+```
+
+分区与根目录版一致：16 MB Flash + `huge_app`（app 3 MB @ `0x10000`）。
+当前体积：**830,785 B（26%）**，静态 RAM **28,728 B（8%）**。
+
+## 界面内容
+
+- 顶部 6 个胶囊：信号图标 / 波段 / 模式 / 时间 / 音量 / 电量
+- 频率大字（Anton 57px）+ MHz 单位，下方中文状态行（微米黑 18 加粗）
+- 右列 SNR / RSSI：竖排数字 + 青色条
+- 底部 5 个参数胶囊（步进 / 带宽 / 增益 / 频率搜索）、40 格刻度尺、红色指针
+- 菜单为中央覆盖层，5 行，选中项固定在第 3 行
+
+配色取自参考固件导出的主题配置：底 `#000000`、边 `#01839D`、正文 `#CFCECE`、次级文字 `#E9E9E9`、选中 `#004E61`、电池底 `#878787`、指针 `#F00000`。
+
+## LVGL 版修掉的坑
+
+1. **`lv_init()` 之后没设 tick**：`lv_timer_handler()` 靠 `lv_tick_get()` 算 elapsed，tick 恒 0 → 刷新定时器永不触发，屏幕停在 `fillScreen(TFT_BLACK)`。加 `lv_tick_set_cb(millis)`。
+2. **背光开得太晚**：SI4735 检测失败时 `while(1)` 卡住，而背光还是 0，整机看起来毫无反应。把 PWM 初始化提到 `uiInit()` 之前。
+3. **字体斑马线**：LVGL 4bpp 位图是**连续 nibble 流、行间不补齐**，按「每行 ceil(w/2) 字节」打包会让奇数宽度字形错位。已按连续流重打包，`decode_font.py` 可离线解码校验。
+4. **中文多 1px 空白且偏左**：`getbbox()` 的返回框已含描边，mkfont 里又加了一次 pad。
+5. **电池正极被裁**：`capBattTip` 超出父对象宽度，加 `LV_OBJ_FLAG_OVERFLOW_VISIBLE`。
+6. 频率多打一位小数、菜单行内中文与数值垂直错位。
+7. `lv_label` 长文本模式在 9.2 里叫 `LV_LABEL_LONG_DOT`（9.3 才改名 `LV_LABEL_LONG_MODE_DOTS`）。
+
+## 尚未验证
+
+- 真机配色与字号微调（参考固件是拍屏/录屏反推的，色值来自配置导出，亮度可能有偏差）
+- 菜单仍是覆盖层，不是真正的 LVGL 列表（阶段二）
+- 熄屏唤醒后的补帧
+
